@@ -73,10 +73,6 @@ HORIZON_DAYS = 366 * 40
 #: Length of every month in an ordinary year.
 _MONTH_LENGTHS = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
 
-#: Weekday index of ``date.weekday()`` inside the day of week field.
-_WEEKDAY_INDEX = (0, 1, 2, 3, 4, 5, 6)
-
-
 class CronError(ValueError):
     """Raised when an expression or a field of it cannot be parsed."""
 
@@ -96,13 +92,13 @@ def _field_number(token, name, low, high, names):
 
 def _sunday_index(moment):
     """Weekday of *moment* counted from Sunday, so Sunday is 0."""
-    return _WEEKDAY_INDEX[moment.weekday()]
+    return (moment.weekday() + 1) % 7
 
 
 def _days_in_month(year, month):
     """Number of days in the given month of the given year."""
     if month == 2:
-        if year % 4 == 0 and year % 100 != 0:
+        if year % 400 == 0 or (year % 4 == 0 and year % 100 != 0):
             return 29
         return 28
     return _MONTH_LENGTHS[month - 1]
@@ -152,7 +148,13 @@ def parse_field(spec, name, low, high, names=None, allow_question=False, fold_su
         raise CronError("%s field is empty" % name)
     ceiling = high + 1 if fold_sunday else high
     values = set()
-    star = spec == "*"
+    star = spec == "*" or (allow_question and spec == "?")
+
+    def add(value):
+        if fold_sunday and value == high + 1:
+            value = low
+        values.add(value)
+
     for item in spec.split(","):
         if not item:
             raise CronError("%s field: %r has an empty item" % (name, spec))
@@ -165,20 +167,19 @@ def parse_field(spec, name, low, high, names=None, allow_question=False, fold_su
             if head == "?" and not allow_question:
                 raise CronError("%s field does not accept '?'" % name)
             start, end = low, ceiling
-            if slash:
-                start = low + step
         elif "-" in head:
             left, _, right = head.partition("-")
             start = _field_number(left, name, low, ceiling, names)
             end = _field_number(right, name, low, ceiling, names)
             if end < start:
-                start, end = end, start
-            if slash:
-                start += step
+                raise CronError(
+                    "%s field: %r is a reversed range" % (name, head)
+                )
         else:
             start = _field_number(head, name, low, ceiling, names)
             end = ceiling if slash else start
-        values.update(range(start, end + 1, step))
+        for value in range(start, end + 1, step):
+            add(value)
     return CronField(name, low, high, values, star)
 
 
@@ -208,7 +209,9 @@ class CronExpression:
         """True when *moment* falls on a day the expression fires on."""
         dom_ok = moment.day in self.day_of_month
         dow_ok = _sunday_index(moment) in self.day_of_week
-        return dom_ok and dow_ok
+        if self.day_of_month.star or self.day_of_week.star:
+            return dom_ok and dow_ok
+        return dom_ok or dow_ok
 
     def matches(self, moment):
         """True when *moment* falls on a minute the expression fires on."""
@@ -233,23 +236,22 @@ class CronExpression:
             raise CronError("next_after expects a datetime, got %r" % (now,))
         if now.tzinfo is not None:
             raise CronError("next_after works on naive local datetimes")
-        current = now.replace(second=0, microsecond=0)
-        horizon = (current + timedelta(days=HORIZON_DAYS)).date()
+        horizon = (now + timedelta(days=HORIZON_DAYS)).date()
         hours = self.hour.sorted_values()
         minutes = self.minute.sorted_values()
-        year, month = current.year, current.month
+        year, month = now.year, now.month
         while True:
             if month in self.month:
                 for number in range(1, _days_in_month(year, month) + 1):
                     day = date(year, month, number)
-                    if day < current.date():
+                    if day < now.date():
                         continue
                     if not self._day_matches(day):
                         continue
                     for hour in hours:
                         for minute in minutes:
                             candidate = datetime.combine(day, time(hour, minute))
-                            if candidate >= current:
+                            if candidate > now:
                                 return candidate
             year, month = _next_month(year, month)
             if date(year, month, 1) > horizon:
